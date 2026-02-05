@@ -10,6 +10,7 @@ from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import logging
 import os
@@ -84,85 +85,100 @@ def get_urls(country):
         ]
     return []
 
-def fetch_via_scraperapi(url, timeout=60):
+def fetch_via_scraperapi(url, timeout=90, retries=2):
     """Fetch a URL via ScraperAPI to bypass Cloudflare"""
     payload = {
         'api_key': SCRAPER_API_KEY,
         'url': url,
         'render': 'true'
     }
-    response = requests.get(SCRAPER_API_URL, params=payload, timeout=timeout)
+    for attempt in range(retries):
+        try:
+            response = requests.get(SCRAPER_API_URL, params=payload, timeout=timeout)
+            if response.status_code == 200:
+                return response
+            logger.warning(f"Attempt {attempt+1}: ScraperAPI returned {response.status_code} for {url}")
+        except Exception as e:
+            logger.warning(f"Attempt {attempt+1} failed for {url}: {str(e)}")
+        if attempt < retries - 1:
+            time.sleep(2)
     return response
 
+def scrape_single_url(url, current_date, current_month):
+    """Scrape a single URL - used by thread pool"""
+    results = []
+    try:
+        logger.info(f"Scraping: {url}")
+        response = fetch_via_scraperapi(url)
+
+        if response.status_code != 200:
+            logger.error(f"ScraperAPI returned {response.status_code} for {url}")
+            return results
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        title = soup.title.string if soup.title else "No title"
+
+        rows = soup.find_all('tr', class_='js-event-item')
+        if not rows:
+            rows = soup.find_all('tr')
+
+        logger.info(f"Found {len(rows)} rows for {url}")
+
+        row_counter = 0
+        for row in rows:
+            if row_counter >= 6:
+                break
+
+            cols = row.find_all('td')
+            if len(cols) >= 6:
+                try:
+                    cols_text = [col.text.strip() for col in cols[:6]]
+                    date_str = cols_text[0]
+                    if is_future_month(date_str, current_month, current_date):
+                        continue
+
+                    results.append({
+                        'title': title,
+                        'date': cols_text[0],
+                        'time': cols_text[1],
+                        'actual': cols_text[2] if cols_text[2] else None,
+                        'forecast': cols_text[3] if cols_text[3] else None,
+                        'previous': cols_text[4] if cols_text[4] else None
+                    })
+                    row_counter += 1
+                    logger.info(f"Successfully scraped row: {cols_text[0]}")
+                except Exception as e:
+                    logger.debug(f"Error processing row: {str(e)}")
+                    continue
+
+        if not results:
+            logger.warning(f"No data found for {url}")
+
+    except Exception as e:
+        logger.error(f"Error scraping {url}: {str(e)}")
+
+    return results
+
 def scrape_data(urls):
-    """Scrape economic data from investing.com via ScraperAPI"""
+    """Scrape economic data from investing.com via ScraperAPI (parallel)"""
     data = []
     current_date = datetime.now()
     current_month = current_date.replace(day=1)
 
-    for url in urls:
-        try:
-            logger.info(f"Scraping: {url}")
-            response = fetch_via_scraperapi(url)
-
-            if response.status_code != 200:
-                logger.error(f"ScraperAPI returned {response.status_code} for {url}")
-                continue
-
-            soup = BeautifulSoup(response.content, 'html.parser')
-            title = soup.title.string if soup.title else "No title"
-
-            # Try different table selectors
-            rows = soup.find_all('tr', class_='js-event-item')  # New investing.com format
-            if not rows:
-                rows = soup.find_all('tr')  # Fallback to all rows
-
-            logger.info(f"Found {len(rows)} rows for {url}")
-
-            row_counter = 0
-            found_data = False
-
-            for row in rows:
-                if row_counter >= 6:
-                    break
-
-                cols = row.find_all('td')
-                logger.debug(f"Row has {len(cols)} columns")
-
-                # Try both 6 and 7 column formats
-                if len(cols) >= 6:
-                    try:
-                        # Extract text from columns
-                        cols_text = [col.text.strip() for col in cols[:6]]
-
-                        # Skip future months
-                        date_str = cols_text[0]
-                        if is_future_month(date_str, current_month, current_date):
-                            continue
-
-                        data.append({
-                            'title': title,
-                            'date': cols_text[0],
-                            'time': cols_text[1],
-                            'actual': cols_text[2] if cols_text[2] else None,
-                            'forecast': cols_text[3] if cols_text[3] else None,
-                            'previous': cols_text[4] if cols_text[4] else None
-                        })
-                        row_counter += 1
-                        found_data = True
-                        logger.info(f"Successfully scraped row: {cols_text[0]}")
-                    except Exception as e:
-                        logger.debug(f"Error processing row: {str(e)}")
-                        continue
-
-            if not found_data:
-                logger.warning(f"No data found for {url}")
-
-            # Small delay between requests to be respectful
-            time.sleep(0.5)
-
-        except Exception as e:
-            logger.error(f"Error scraping {url}: {str(e)}")
+    # Fetch up to 5 URLs in parallel
+    MAX_WORKERS = 5
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(scrape_single_url, url, current_date, current_month): url
+            for url in urls
+        }
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                results = future.result()
+                data.extend(results)
+            except Exception as e:
+                logger.error(f"Thread error for {url}: {str(e)}")
 
     logger.info(f"Total data points scraped: {len(data)}")
     return data
@@ -180,9 +196,9 @@ def is_future_month(date_str, current_month, current_date):
 def parse_date(date_str):
     """Parse date string from investing.com format"""
     patterns = [
-        r'(\w+ \d{2}, \d{4}) \((\w+)\)',
+        r'(\w+ \d{2}, \d{4})\s+\((\w+)\)',
         r'(\w+ \d{2}, \d{4})',
-        r'(\w+ \d{2}, \d{4}) \(Q\d\)'
+        r'(\w+ \d{2}, \d{4})\s+\(Q\d\)'
     ]
 
     for pattern in patterns:
@@ -278,28 +294,36 @@ def process_data(raw_data, country):
                 'actual': item['actual'] if item['actual'] and item['actual'] != '-' else None
             })
 
-    # Format for frontend - map data to actual calendar months
+    # Format for frontend - map data to calendar months, starting from latest available
     result = []
-    now = datetime.now()
-    current_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-    # Build list of target months: this month, 1 month ago, 2 months ago, etc.
-    target_months = []
-    for i in range(5):
-        m = current_month - timedelta(days=1)  # go to previous month
-        if i == 0:
-            m = current_month
-        else:
-            m = current_month
-            for _ in range(i):
-                m = (m - timedelta(days=1)).replace(day=1)
-        target_months.append(m)
 
     # Month abbreviation map for matching monthInParentheses
     month_abbrs = {
         'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
         'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
     }
+
+    def get_ref_key(dp):
+        """Get the (year, month) reference key for a data point"""
+        ref_month = dp.get('monthInParentheses')
+        release_date = datetime.fromisoformat(dp['date'])
+        if ref_month and ref_month in month_abbrs:
+            ref_month_num = month_abbrs[ref_month]
+            ref_year = release_date.year
+            if ref_month_num > release_date.month:
+                ref_year -= 1
+            return (ref_year, ref_month_num)
+        else:
+            return (release_date.year, release_date.month)
+
+    def prev_month(year, month, steps=1):
+        """Go back N months from (year, month)"""
+        for _ in range(steps):
+            month -= 1
+            if month < 1:
+                month = 12
+                year -= 1
+        return (year, month)
 
     for indicator, data_points in indicators.items():
         if data_points:
@@ -319,31 +343,20 @@ def process_data(raw_data, country):
             if latest['monthInParentheses']:
                 date_str += f" ({latest['monthInParentheses']})"
 
-            # Map data points to calendar months using monthInParentheses
-            # The reference month (in parentheses) tells us which calendar month this data belongs to
+            # Map data points to calendar months using reference month
             month_data = {}  # key: (year, month) -> data point
             for dp in sorted_data:
-                ref_month = dp.get('monthInParentheses')
-                release_date = datetime.fromisoformat(dp['date'])
-                if ref_month and ref_month in month_abbrs:
-                    # Use the reference month from parentheses
-                    ref_month_num = month_abbrs[ref_month]
-                    # Determine the year: if reference month > release month, it's previous year
-                    ref_year = release_date.year
-                    if ref_month_num > release_date.month:
-                        ref_year -= 1
-                    key = (ref_year, ref_month_num)
-                else:
-                    # No parentheses - use the release date's month
-                    key = (release_date.year, release_date.month)
-
+                key = get_ref_key(dp)
                 if key not in month_data:
                     month_data[key] = dp
 
-            # Map to target months (本月, 1月前, 2月前, 3月前, 4月前)
-            def get_month_value(month_idx):
-                target = target_months[month_idx]
-                key = (target.year, target.month)
+            # Find the latest reference month that has actual data
+            latest_key = get_ref_key(latest)
+            base_year, base_month = latest_key
+
+            # Build 5 columns starting from the latest month with data
+            def get_month_value(steps_back):
+                key = prev_month(base_year, base_month, steps_back)
                 dp = month_data.get(key)
                 if dp and dp['actual']:
                     return dp['actual']
@@ -366,7 +379,7 @@ def process_data(raw_data, country):
                 'date': date_str,
                 'vsForcast': latest['vsForcast'] if latest['actual'] else '',
                 'forecast': latest['forecast'] if latest['forecast'] else 'None',
-                'current': get_month_value(0),   # 本月 (this month)
+                'current': get_month_value(0),   # 本月 = latest reference month
                 'month1': get_month_value(1),    # 1月前
                 'month2': get_month_value(2),    # 2月前
                 'month3': get_month_value(3),    # 3月前
