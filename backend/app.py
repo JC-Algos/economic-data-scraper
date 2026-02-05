@@ -5,7 +5,7 @@ Deploy this to Heroku, Railway, Render, or any Python hosting service
 Uses ScraperAPI to bypass Cloudflare protection on investing.com
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
@@ -278,45 +278,102 @@ def process_data(raw_data, country):
                 'actual': item['actual'] if item['actual'] and item['actual'] != '-' else None
             })
 
-    # Format for frontend
+    # Format for frontend - map data to actual calendar months
     result = []
+    now = datetime.now()
+    current_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Build list of target months: this month, 1 month ago, 2 months ago, etc.
+    target_months = []
+    for i in range(5):
+        m = current_month - timedelta(days=1)  # go to previous month
+        if i == 0:
+            m = current_month
+        else:
+            m = current_month
+            for _ in range(i):
+                m = (m - timedelta(days=1)).replace(day=1)
+        target_months.append(m)
+
+    # Month abbreviation map for matching monthInParentheses
+    month_abbrs = {
+        'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+        'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
+    }
+
     for indicator, data_points in indicators.items():
         if data_points:
             sorted_data = sorted(data_points, key=lambda x: x['date'], reverse=True)
 
-            # Get latest 5 data points
-            latest = sorted_data[0] if sorted_data else None
-            if latest:
-                date_obj = datetime.fromisoformat(latest['date'])
-                date_str = date_obj.strftime("%b %d, %Y")
-                if latest['monthInParentheses']:
-                    date_str += f" ({latest['monthInParentheses']})"
+            # Get latest data point that has actual data
+            latest = None
+            for dp in sorted_data:
+                if dp['actual']:
+                    latest = dp
+                    break
+            if not latest:
+                latest = sorted_data[0]
 
-                # Build historical data for charts
-                historical_data = []
-                for dp in sorted_data[:10]:  # Get up to 10 data points
-                    try:
-                        historical_data.append({
-                            'date': dp['date'],
-                            'actual': float(parse_value(dp['actual'])) if dp['actual'] else None,
-                            'forecast': float(parse_value(dp['forecast'])) if dp['forecast'] else None
-                        })
-                    except:
-                        pass
+            date_obj = datetime.fromisoformat(latest['date'])
+            date_str = date_obj.strftime("%b %d, %Y")
+            if latest['monthInParentheses']:
+                date_str += f" ({latest['monthInParentheses']})"
 
-                result.append({
-                    'indicator': indicator,
-                    'date': date_str,
-                    'vsForcast': latest['vsForcast'] if latest['actual'] else '',
-                    'forecast': latest['forecast'] if latest['forecast'] else 'None',
-                    'current': sorted_data[0]['actual'] if len(sorted_data) > 0 and sorted_data[0]['actual'] else 'None',
-                    'month1': sorted_data[1]['actual'] if len(sorted_data) > 1 and sorted_data[1]['actual'] else 'None',
-                    'month2': sorted_data[2]['actual'] if len(sorted_data) > 2 and sorted_data[2]['actual'] else 'None',
-                    'month3': sorted_data[3]['actual'] if len(sorted_data) > 3 and sorted_data[3]['actual'] else 'None',
-                    'month4': sorted_data[4]['actual'] if len(sorted_data) > 4 and sorted_data[4]['actual'] else 'None',
-                    'category': get_category(indicator, country),
-                    'historicalData': historical_data
-                })
+            # Map data points to calendar months using monthInParentheses
+            # The reference month (in parentheses) tells us which calendar month this data belongs to
+            month_data = {}  # key: (year, month) -> data point
+            for dp in sorted_data:
+                ref_month = dp.get('monthInParentheses')
+                release_date = datetime.fromisoformat(dp['date'])
+                if ref_month and ref_month in month_abbrs:
+                    # Use the reference month from parentheses
+                    ref_month_num = month_abbrs[ref_month]
+                    # Determine the year: if reference month > release month, it's previous year
+                    ref_year = release_date.year
+                    if ref_month_num > release_date.month:
+                        ref_year -= 1
+                    key = (ref_year, ref_month_num)
+                else:
+                    # No parentheses - use the release date's month
+                    key = (release_date.year, release_date.month)
+
+                if key not in month_data:
+                    month_data[key] = dp
+
+            # Map to target months (本月, 1月前, 2月前, 3月前, 4月前)
+            def get_month_value(month_idx):
+                target = target_months[month_idx]
+                key = (target.year, target.month)
+                dp = month_data.get(key)
+                if dp and dp['actual']:
+                    return dp['actual']
+                return 'None'
+
+            # Build historical data for charts
+            historical_data = []
+            for dp in sorted_data[:10]:
+                try:
+                    historical_data.append({
+                        'date': dp['date'],
+                        'actual': float(parse_value(dp['actual'])) if dp['actual'] else None,
+                        'forecast': float(parse_value(dp['forecast'])) if dp['forecast'] else None
+                    })
+                except:
+                    pass
+
+            result.append({
+                'indicator': indicator,
+                'date': date_str,
+                'vsForcast': latest['vsForcast'] if latest['actual'] else '',
+                'forecast': latest['forecast'] if latest['forecast'] else 'None',
+                'current': get_month_value(0),   # 本月 (this month)
+                'month1': get_month_value(1),    # 1月前
+                'month2': get_month_value(2),    # 2月前
+                'month3': get_month_value(3),    # 3月前
+                'month4': get_month_value(4),    # 4月前
+                'category': get_category(indicator, country),
+                'historicalData': historical_data
+            })
 
     return result
 
@@ -344,14 +401,16 @@ def check_api_key():
 
 @app.route('/', methods=['GET'])
 def home():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'running',
-        'message': 'Economic Data Scraper API',
-        'endpoints': {
-            '/scrape': 'GET - Scrape economic data (params: country=US|China)'
-        }
-    })
+    """Serve frontend or health check"""
+    if request.args.get('health') == '1':
+        return jsonify({
+            'status': 'running',
+            'message': 'Economic Data Scraper API',
+            'endpoints': {
+                '/scrape': 'GET - Scrape economic data (params: country=US|China)'
+            }
+        })
+    return send_from_directory('.', 'frontend.html')
 
 @app.route('/scrape', methods=['GET'])
 def scrape():
